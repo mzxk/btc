@@ -11,13 +11,49 @@ import (
 	"github.com/btcsuite/btcd/wire"
 )
 
+const dustThreshold int64 = 546
+
+func (w *BitcoinWallet) estimateFee(inputCount, outputCount int, addrType AddressType) int64 {
+	size := w.EstimateTxSize(inputCount, outputCount, addrType)
+	return int64(size) * w.feeRate
+}
+
+func (w *BitcoinWallet) computeFeeAndChange(
+	fromAddrType AddressType,
+	amount int64,
+	utxos []UTXO,
+	totalValue int64,
+) (fee int64, changeAmount int64) {
+	if len(utxos) == 0 {
+		return 0, -amount
+	}
+
+	// 先计算仅有接收方输出时的费用
+	feeNoChange := w.estimateFee(len(utxos), 1, fromAddrType)
+	changeNoChange := totalValue - amount - feeNoChange
+	if changeNoChange < 0 {
+		return feeNoChange, changeNoChange
+	}
+
+	// 再计算包含找零输出时的费用
+	feeWithChange := w.estimateFee(len(utxos), 2, fromAddrType)
+	changeWithChange := totalValue - amount - feeWithChange
+	if changeWithChange > dustThreshold {
+		return feeWithChange, changeWithChange
+	}
+
+	// 找零过小，作为手续费处理
+	actualFee := totalValue - amount
+	return actualFee, 0
+}
+
 // CreateTransaction 创建交易
 func (w *BitcoinWallet) CreateTransaction(
 	fromAddrType AddressType,
 	toAddress string,
 	amount int64,
 	utxos []UTXO,
-	totalValue int64,
+	changeAmount int64,
 ) (*wire.MsgTx, error) {
 	// 创建新交易
 	tx := wire.NewMsgTx(wire.TxVersion)
@@ -48,13 +84,6 @@ func (w *BitcoinWallet) CreateTransaction(
 	// 添加接收方输出
 	tx.AddTxOut(wire.NewTxOut(amount, receiverScript))
 
-	// 计算找零金额
-	estimatedSize := w.EstimateTxSize(len(utxos), 2, fromAddrType)
-	estimatedFee := int64(estimatedSize) * w.feeRate
-	changeAmount := totalValue - amount - estimatedFee
-
-	// 如果找零金额大于防尘阈值，则创建找零输出
-	dustThreshold := int64(546)
 	if changeAmount > dustThreshold {
 		// 获取找零地址（使用相同的地址类型）
 		changeAddr, err := w.GetAddress(fromAddrType)
@@ -139,19 +168,29 @@ func (w *BitcoinWallet) SendTransaction(fromAddrType AddressType, toAddress stri
 		return "", fmt.Errorf("没有可用的UTXO")
 	}
 
-	// 计算所需金额（包含手续费）
-	estimatedSize := w.EstimateTxSize(len(utxos), 2, fromAddrType)
-	estimatedFee := int64(estimatedSize) * w.feeRate
-	requiredAmount := amount + estimatedFee
+	// 选择UTXO时动态计算手续费
+	requiredAmount := amount
+	var selectedUTXOs []UTXO
+	var totalValue int64
+	var estimatedFee int64
+	var changeAmount int64
 
-	// 选择UTXO
-	selectedUTXOs, totalValue, err := w.SelectUTXOs(utxos, requiredAmount)
-	if err != nil {
-		return "", fmt.Errorf("选择UTXO失败: %w", err)
+	for {
+		selectedUTXOs, totalValue, err = w.SelectUTXOs(utxos, requiredAmount)
+		if err != nil {
+			return "", fmt.Errorf("选择UTXO失败: %w", err)
+		}
+
+		estimatedFee, changeAmount = w.computeFeeAndChange(fromAddrType, amount, selectedUTXOs, totalValue)
+		if changeAmount >= 0 {
+			break
+		}
+
+		requiredAmount = amount + estimatedFee
 	}
 
 	// 创建交易
-	tx, err := w.CreateTransaction(fromAddrType, toAddress, amount, selectedUTXOs, totalValue)
+	tx, err := w.CreateTransaction(fromAddrType, toAddress, amount, selectedUTXOs, changeAmount)
 	if err != nil {
 		return "", fmt.Errorf("创建交易失败: %w", err)
 	}
@@ -271,8 +310,13 @@ func (w *BitcoinWallet) CreateRawTransaction(
 		totalValue += utxo.Value
 	}
 
+	_, changeAmount := w.computeFeeAndChange(fromAddrType, amount, utxos, totalValue)
+	if changeAmount < 0 {
+		return "", fmt.Errorf("余额不足以支付金额和手续费")
+	}
+
 	// 创建交易
-	tx, err := w.CreateTransaction(fromAddrType, toAddress, amount, utxos, totalValue)
+	tx, err := w.CreateTransaction(fromAddrType, toAddress, amount, utxos, changeAmount)
 	if err != nil {
 		return "", fmt.Errorf("创建交易失败: %w", err)
 	}
