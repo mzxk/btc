@@ -286,6 +286,10 @@ func (w *BitcoinWallet) SelectUTXOs(utxos []UTXO, amount int64) ([]UTXO, int64, 
 		return nil, 0, fmt.Errorf("没有可用的UTXO")
 	}
 
+	if amount <= 0 {
+		return nil, 0, fmt.Errorf("金额必须大于0")
+	}
+
 	sorted := append([]UTXO(nil), utxos...)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].Value < sorted[j].Value
@@ -295,6 +299,10 @@ func (w *BitcoinWallet) SelectUTXOs(utxos []UTXO, amount int64) ([]UTXO, int64, 
 	var total int64
 
 	for _, utxo := range sorted {
+		if utxo.Value <= 0 {
+			continue
+		}
+
 		selected = append(selected, utxo)
 		total += utxo.Value
 
