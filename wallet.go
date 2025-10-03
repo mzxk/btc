@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -20,10 +23,10 @@ import (
 type AddressType string
 
 const (
-	P2PKH AddressType = "p2pkh" // 1开头地址
+	P2PKH  AddressType = "p2pkh"  // 1开头地址
 	P2WPKH AddressType = "p2wpkh" // bc1q开头地址
-	P2SH AddressType = "p2sh" // 3开头地址
-	P2TR AddressType = "p2tr" // bc1p开头地址
+	P2SH   AddressType = "p2sh"   // 3开头地址
+	P2TR   AddressType = "p2tr"   // bc1p开头地址
 )
 
 // Network 网络类型
@@ -48,6 +51,7 @@ type BitcoinWallet struct {
 	network    *chaincfg.Params
 	apiURL     string
 	feeRate    int64 // satoshi per byte
+	httpClient *http.Client
 }
 
 // NewWallet 创建新钱包
@@ -81,6 +85,7 @@ func NewWallet(wif string, network Network) (*BitcoinWallet, error) {
 		network:    netParams,
 		apiURL:     apiURL,
 		feeRate:    1, // 默认费率 1 sat/byte
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}, nil
 }
 
@@ -166,11 +171,20 @@ func (w *BitcoinWallet) getP2TRAddress() (string, error) {
 func (w *BitcoinWallet) GetBalance(address string) (int64, error) {
 	url := fmt.Sprintf("%s/address/%s", w.apiURL, address)
 
-	resp, err := http.Get(url)
+	resp, err := w.httpClient.Get(url)
 	if err != nil {
 		return 0, fmt.Errorf("请求余额失败: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return 0, fmt.Errorf("请求余额失败: %s", msg)
+	}
 
 	var result struct {
 		ChainStats struct {
@@ -190,11 +204,20 @@ func (w *BitcoinWallet) GetBalance(address string) (int64, error) {
 func (w *BitcoinWallet) GetUTXOs(address string) ([]UTXO, error) {
 	url := fmt.Sprintf("%s/address/%s/utxo", w.apiURL, address)
 
-	resp, err := http.Get(url)
+	resp, err := w.httpClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("请求UTXO失败: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return nil, fmt.Errorf("请求UTXO失败: %s", msg)
+	}
 
 	var utxos []UTXO
 	if err := json.NewDecoder(resp.Body).Decode(&utxos); err != nil {
@@ -208,11 +231,20 @@ func (w *BitcoinWallet) GetUTXOs(address string) ([]UTXO, error) {
 func (w *BitcoinWallet) GetTxHex(txID string) (string, error) {
 	url := fmt.Sprintf("%s/tx/%s/hex", w.apiURL, txID)
 
-	resp, err := http.Get(url)
+	resp, err := w.httpClient.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("请求交易数据失败: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return "", fmt.Errorf("请求交易数据失败: %s", msg)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -226,7 +258,7 @@ func (w *BitcoinWallet) GetTxHex(txID string) (string, error) {
 func (w *BitcoinWallet) BroadcastTransaction(txHex string) (string, error) {
 	url := fmt.Sprintf("%s/tx", w.apiURL)
 
-	resp, err := http.Post(url, "text/plain", bytes.NewBufferString(txHex))
+	resp, err := w.httpClient.Post(url, "text/plain", bytes.NewBufferString(txHex))
 	if err != nil {
 		return "", fmt.Errorf("广播交易失败: %w", err)
 	}
@@ -237,8 +269,12 @@ func (w *BitcoinWallet) BroadcastTransaction(txHex string) (string, error) {
 		return "", fmt.Errorf("读取响应失败: %w", err)
 	}
 
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("广播失败: %s", string(body))
+	if resp.StatusCode != http.StatusOK {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return "", fmt.Errorf("广播失败: %s", msg)
 	}
 
 	return string(body), nil
@@ -246,10 +282,19 @@ func (w *BitcoinWallet) BroadcastTransaction(txHex string) (string, error) {
 
 // SelectUTXOs 选择足够的UTXO来支付
 func (w *BitcoinWallet) SelectUTXOs(utxos []UTXO, amount int64) ([]UTXO, int64, error) {
+	if len(utxos) == 0 {
+		return nil, 0, fmt.Errorf("没有可用的UTXO")
+	}
+
+	sorted := append([]UTXO(nil), utxos...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Value < sorted[j].Value
+	})
+
 	var selected []UTXO
 	var total int64
 
-	for _, utxo := range utxos {
+	for _, utxo := range sorted {
 		selected = append(selected, utxo)
 		total += utxo.Value
 
@@ -337,7 +382,7 @@ func (w *BitcoinWallet) SignP2WPKHTransaction(tx *wire.MsgTx, idx int, value int
 func (w *BitcoinWallet) SignP2SHTransaction(tx *wire.MsgTx, idx int, value int64, pkScript []byte) error {
 	// 获取发送方地址的公钥哈希
 	pubKeyHash := btcutil.Hash160(w.publicKey.SerializeCompressed())
-	
+
 	// 创建P2WPKH赎回脚本
 	witnessScript, err := txscript.NewScriptBuilder().
 		AddOp(txscript.OP_0).
@@ -346,28 +391,28 @@ func (w *BitcoinWallet) SignP2SHTransaction(tx *wire.MsgTx, idx int, value int64
 	if err != nil {
 		return fmt.Errorf("创建赎回脚本失败: %w", err)
 	}
-	
+
 	// 计算签名哈希（使用P2WPKH脚本，因为这是嵌套SegWit）
 	prevFetcher := txscript.NewCannedPrevOutputFetcher(pkScript, value)
 	sigHashes := txscript.NewTxSigHashes(tx, prevFetcher)
-	
+
 	sigHash, err := txscript.CalcWitnessSigHash(
 		witnessScript, sigHashes, txscript.SigHashAll, tx, idx, value,
 	)
 	if err != nil {
 		return fmt.Errorf("计算witness签名哈希失败: %w", err)
 	}
-	
+
 	// 生成签名
 	signature := ecdsa.Sign(w.privateKey, sigHash)
 	sigWithHashType := append(signature.Serialize(), byte(txscript.SigHashAll))
-	
+
 	// 设置witness数据（签名 + 公钥）
 	tx.TxIn[idx].Witness = wire.TxWitness{
 		sigWithHashType,
 		w.publicKey.SerializeCompressed(),
 	}
-	
+
 	// 设置SignatureScript为完整的赎回脚本（这是P2SH-Nested SegWit的正确方式）
 	tx.TxIn[idx].SignatureScript, err = txscript.NewScriptBuilder().
 		AddData(witnessScript).
@@ -375,7 +420,7 @@ func (w *BitcoinWallet) SignP2SHTransaction(tx *wire.MsgTx, idx int, value int64
 	if err != nil {
 		return fmt.Errorf("构建签名脚本失败: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -383,25 +428,25 @@ func (w *BitcoinWallet) SignP2SHTransaction(tx *wire.MsgTx, idx int, value int64
 func (w *BitcoinWallet) SignP2TRTransaction(tx *wire.MsgTx, idx int, value int64, pkScript []byte) error {
 	// 对于P2TR，需要重新生成正确的prevOutputScript
 	// 因为传入的pkScript可能是通过PayToAddrScript生成的，但P2TR需要特殊的处理
-	
+
 	// 生成P2TR地址
 	p2trAddr, err := w.getP2TRAddress()
 	if err != nil {
 		return fmt.Errorf("获取P2TR地址失败: %w", err)
 	}
-	
+
 	// 解析P2TR地址
 	addrObj, err := btcutil.DecodeAddress(p2trAddr, w.network)
 	if err != nil {
 		return fmt.Errorf("解析P2TR地址失败: %w", err)
 	}
-	
+
 	// 生成正确的P2TR输出脚本
 	prevScript, err := txscript.PayToAddrScript(addrObj)
 	if err != nil {
 		return fmt.Errorf("生成P2TR脚本失败: %w", err)
 	}
-	
+
 	// 创建PrevOutputFetcher
 	prevFetcher := txscript.NewCannedPrevOutputFetcher(prevScript, value)
 	sighashes := txscript.NewTxSigHashes(tx, prevFetcher)
